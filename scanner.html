@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>AKAS 직원 스캐너 (라이브)</title>
+  <!--
+    외부 라이브 스캐너 — GitHub Pages 등 "진짜 HTTPS 출처"에 올려서 씁니다.
+    (Apps Script iframe은 opaque origin이라 라이브 카메라(getUserMedia)가 막힘 → 여기로 분리)
+    스캔 결과를 백엔드 doPost(action:'scan')로 보내 참여(현장)의 '인증'을 Y로 만듭니다.
+    ⚠️ 아래 APP2_URL, STAFF_KEY 두 줄을 본인 값으로 바꾸세요. (백엔드 main.gs 와 동일하게)
+  -->
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family:-apple-system,"Segoe UI","Malgun Gothic",sans-serif;
+           margin:0; padding:20px; background:#101418; color:#f0f0f0; }
+    .card { max-width:480px; margin:0 auto; }
+    h1 { font-size:20px; margin:0 0 4px; }
+    .sub { color:#9aa4af; font-size:13px; margin-bottom:16px; }
+    #reader { width:100%; border-radius:14px; overflow:hidden; background:#000; }
+    #reader:empty { min-height:0; }
+    button { width:100%; padding:15px; font-size:17px; font-weight:800; color:#fff;
+             background:#2b6cb0; border:none; border-radius:12px; margin-top:14px; cursor:pointer; }
+    button:active { background:#245a96; }
+    button:disabled { background:#3a4654; }
+    #status { margin-top:16px; padding:18px; border-radius:12px; text-align:center;
+              font-size:18px; font-weight:700; display:none; }
+    .ok   { background:#1c4532; color:#9ae6b4; }
+    .warn { background:#3d2c12; color:#fbd38d; }
+    .err  { background:#4a1d1d; color:#feb2b2; }
+    .name { font-size:22px; display:block; margin-top:4px; }
+    .hint { color:#6b7682; font-size:12px; margin-top:12px; text-align:center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>직원 스캐너 (라이브)</h1>
+    <div class="sub">카메라에 참가자 입장 QR을 비추면 자동으로 체크인됩니다.</div>
+
+    <div id="reader"></div>
+    <button id="startBtn" onclick="start()">📷 카메라 시작</button>
+    <button id="stopBtn" onclick="stop()" style="display:none;background:#4a1d1d;">■ 정지</button>
+    <div id="status"></div>
+    <div class="hint" id="hint"></div>
+  </div>
+
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script>
+    // ===== ⚠️ 본인 값으로 교체 (백엔드 main.gs 와 동일) =====
+    var APP2_URL  = 'https://script.google.com/macros/s/백엔드_배포후_URL_붙여넣기/exec';
+    var STAFF_KEY = 'key_akas_1213';
+    // ======================================================
+
+    var COOLDOWN_MS = 1500;   // 한 건 처리 후 다음 스캔까지 쉬는 시간
+    var SAME_QR_MS  = 3000;   // 같은 QR 연속 인식 무시 시간
+    var qr = new Html5Qrcode("reader");
+    var running = false, busy = false, lastCode = '', lastAt = 0;
+
+    function start(){
+      if(running) return;
+      setHint('카메라 권한을 허용해 주세요.');
+      qr.start({ facingMode: "environment" },
+               { fps: 10, qrbox: { width: 250, height: 250 } },
+               onScan, function(){})
+        .then(function(){
+          running = true;
+          document.getElementById('startBtn').style.display='none';
+          document.getElementById('stopBtn').style.display='block';
+          setHint('QR을 사각 안에 비추세요. 연속으로 찍을 수 있어요.');
+        })
+        .catch(function(e){
+          showStatus('err','❌ 카메라를 열 수 없습니다: ' + (e && e.message ? e.message : e));
+          setHint('HTTPS 주소인지, 브라우저 카메라 권한이 허용됐는지 확인하세요.');
+        });
+    }
+
+    function stop(){
+      if(!running) return;
+      qr.stop().then(function(){
+        running = false;
+        document.getElementById('stopBtn').style.display='none';
+        document.getElementById('startBtn').style.display='block';
+        setHint('정지됨.');
+      });
+    }
+
+    // 라이브 디코드 콜백 — QR이 보이는 동안 여러 번 불리므로 잠금/쿨다운으로 한 건씩만 처리
+    function onScan(text){
+      var code = String(text).trim();
+      var now = Date.now();
+      if(busy) return;
+      if(code === lastCode && (now - lastAt) < SAME_QR_MS) return;  // 같은 QR 연속 무시
+      busy = true; lastCode = code; lastAt = now;
+      showStatus('warn','인식됨 · 전송 중…');
+      // text/plain → CORS preflight 회피("단순 요청"). 응답은 googleusercontent가 ACAO:* 로 줘서 읽힘.
+      fetch(APP2_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'scan', code: code, staffKey: STAFF_KEY })
+      })
+      .then(function(r){ return r.json(); })
+      .then(onResult)
+      .catch(function(e){ showStatus('err','❌ 전송 오류: ' + (e && e.message ? e.message : e)); })
+      .then(function(){ setTimeout(function(){ busy = false; }, COOLDOWN_MS); });
+    }
+
+    function onResult(res){
+      if(!res || !res.ok){
+        if(res && res.error === 'bad-staff-key') return showStatus('err','❌ 직원 키가 틀렸습니다 (STAFF_KEY 확인).');
+        if(res && res.reason === 'notfound')      return showStatus('err','❌ 등록 안 된 QR입니다.');
+        return showStatus('err','❌ 처리 실패: ' + (res && (res.error||res.reason) ? (res.error||res.reason) : '알 수 없음'));
+      }
+      var who = (res.name||'') + (res.org ? ' / '+res.org : '');
+      if(res.already) showStatus('warn','⚠️ 이미 체크인됨<span class="name">'+esc(who)+'</span>');
+      else            showStatus('ok','✅ 체크인 완료<span class="name">'+esc(who)+'</span>');
+    }
+
+    function showStatus(cls, html){
+      var s=document.getElementById('status'); s.className=cls; s.innerHTML=html; s.style.display='block';
+    }
+    function setHint(t){ document.getElementById('hint').textContent = t; }
+    function esc(s){ return String(s).replace(/[<>&]/g, function(c){ return ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c]; }); }
+  </script>
+</body>
+</html>
